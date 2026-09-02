@@ -90,9 +90,45 @@ const HEARTBEAT_TIMEOUT_MS = 4000;
 // declarava o Tor morto de 30 em 30s e o modo tor, que nao cai para direta, segurava o gateway
 // para sempre; so reiniciar o Discord resolvia. O prazo do trafego vivo cabe folgado no
 // orcamento de espera deste modo (TOR_HOLD_BUDGET_MS, 45s).
-const TOR_RELAY_TIMEOUT_MS = 8000;
-const TOR_HEARTBEAT_TIMEOUT_MS = 8000;
-const TOR_PROBE_TIMEOUT_MS = 10_000;
+// Revisados em 02/09/2026. Com 8s/8s/10s o probe abria um circuito NOVO a cada batimento e
+// reprovava o Tor antes de o circuito fechar (build medido em 16-86s nesta rede), enquanto o
+// trafego vivo, que reusa o circuito quente, entregava em 427ms: o plugin declarava morto um
+// daemon que funcionava. Os prazos abaixo cabem no TOR_HOLD_BUDGET_MS (45s) e no HEARTBEAT_MS
+// (30s). Esperar 15s pelo gateway e ruim; ser recusado e pior.
+const TOR_RELAY_TIMEOUT_MS = 15_000;
+const TOR_HEARTBEAT_TIMEOUT_MS = 15_000;
+const TOR_PROBE_TIMEOUT_MS = 20_000;
+// Prazo do probe durante a insistencia do arranque, onde ele nao e uma conexao que precisa dar
+// certo e sim um teste que sera repetido em segundos. Ai a assimetria se inverte: prazo curto
+// cabe mais tentativas na mesma janela, e o Tor bom responde em 300ms-2s. Medido em 02/09/2026
+// com 20s: tres tentativas seguidas estouraram o prazo cheio e a rota so subiu depois de 61s;
+// a quarta, que deu certo, veio em 315ms. Esperar 20s por uma tentativa ruim so adia a boa.
+const TOR_ARRANQUE_PROBE_MS = 8000;
+
+// Ritmo do batimento e da busca no modo "tor". Cada probe abre um circuito NOVO, e circuito
+// novo e a operacao cara do Tor; medido em 02/09/2026, o CONNECT ao gateway pelo SOCKS tem
+// mediana de 1382ms mas picos de 8-15s. Com o batimento de 30s e a busca de 15s o plugin
+// mantinha duas construcoes de circuito por minuto disputando banda com o trafego vivo -- e o
+// que sobrava era o proprio gateway estourando o prazo. Nada disso comprava nada: no modo tor
+// nao ha reserva para assumir, entao descobrir cedo que o Tor tropecou nao muda a acao.
+const TOR_HEARTBEAT_MS = 120_000;
+const TOR_REFRESH_COOLDOWN_MS = 60_000;
+
+// Quantas vezes o trafego vivo insiste na MESMA saida antes de desistir, no modo "tor". O Tor
+// entrega o CONNECT com mediana de ~1.4s, mas com cauda longa: medido em 02/09/2026, 10 CONNECTs
+// seguidos ao gateway deram 10/10 sucesso com mediana 1382ms e picos de 7.7s, 8.1s e 14.9s. Uma
+// tentativa so significa que quem cai na cauda e recusado, e recusar o gateway e exatamente a
+// tela de carregamento que nao sai -- mesmo com o Tor de pe e funcionando. A tentativa seguinte
+// costuma pegar um circuito ja pronto e voltar em menos de um segundo.
+const TOR_TENTATIVAS_TUNEL = 3;
+
+function heartbeatIntervalo() {
+    return routeMode === "tor" ? TOR_HEARTBEAT_MS : HEARTBEAT_MS;
+}
+
+function refreshCooldown() {
+    return routeMode === "tor" ? TOR_REFRESH_COOLDOWN_MS : REFRESH_COOLDOWN_MS;
+}
 
 function relayTimeout() {
     return routeMode === "tor" ? TOR_RELAY_TIMEOUT_MS : RELAY_TIMEOUT_MS;
@@ -103,7 +139,8 @@ function heartbeatTimeout() {
 }
 
 function probeTimeout() {
-    return routeMode === "tor" ? TOR_PROBE_TIMEOUT_MS : PROBE_TIMEOUT_MS;
+    if (routeMode !== "tor") return PROBE_TIMEOUT_MS;
+    return insistindoNoTor ? TOR_ARRANQUE_PROBE_MS : TOR_PROBE_TIMEOUT_MS;
 }
 
 // Quantos batimentos seguidos uma saida pode errar antes de sair do pote. Cortar no primeiro
@@ -230,6 +267,15 @@ const quarentena = new Map();     // proxy -> ate quando fica evitada
 
 function quarentenar(proxy, motivo) {
     if (proxy === null) return;
+    // No modo "tor" a unica saida e o proprio Tor. Poe-la de castigo nao abre espaco para
+    // alternativa nenhuma -- so faz o roteador recusar o gateway por QUARENTENA_MS, que e
+    // exatamente a tela de carregamento infinita que este modo existe para evitar. Medido em
+    // 02/09/2026: "em quarentena ate daqui a 90s (3+ reconexoes sem troca util)" com o Tor
+    // sendo a unica saida que o modo aceita.
+    if (routeMode === "tor") {
+        log(safeProxy(proxy) + " poupada da quarentena: no modo tor nao ha outra saida (" + motivo + ")");
+        return;
+    }
     if (proxy === manualProxy()) {
         log(safeProxy(proxy) + " poupada da quarentena por ser a saida configurada (" + motivo + ")");
         return;
@@ -963,7 +1009,25 @@ function escreveTorrc(casa, porta) {
     const linhas = [
         "SocksPort " + porta,
         "DataDirectory " + join(casa, "data-state"),
-        "Log notice file " + join(casa, "tor.log")
+        "Log notice file " + join(casa, "tor.log"),
+
+        // Prazo de STREAM, nao de circuito: quanto o Tor espera pelo CONNECT dentro de um
+        // circuito JA PRONTO antes de soltar o stream e tentar em outro. Dez segundos e o piso
+        // que o Tor aceita.
+        //
+        // O prazo de CIRCUITO fica com o Tor, de proposito. Fixa-lo aqui ("LearnCircuitBuildTimeout 0"
+        // + "CircuitBuildTimeout 10", tentado em 01/09/2026) saiu pela culatra: o tor.log desta
+        // maquina mostra o build levando 16s e ate 86s (02/09/2026, "Bootstrapped 95%" ->
+        // "100%"), entao um teto de 10s descartava justamente o circuito que ia fechar. O daemon
+        // nunca guardava circuito quente, todo tunel estourava os 8s do relay, o plugin declarava
+        // o daemon zumbi e o reiniciava -- 19 reinicios num dia, cada um pagando o bootstrap do
+        // zero com o gateway segurado. O aprendizado adaptativo do Tor existe exatamente para
+        // uma rede que oscila assim.
+        "CircuitStreamTimeout 10",
+        // O gateway e um websocket que fica de pe a sessao inteira. Sem a 443 nesta lista o Tor
+        // trata a conexao como trafego curto e aceita reaproveitar circuito perto de expirar;
+        // com ela, escolhe relay estavel e nao troca o circuito debaixo da conexao viva.
+        "LongLivedPorts 443"
     ];
 
     for (const nome of ["geoip", "geoip6"]) {
@@ -1031,6 +1095,9 @@ async function subirTor(porta) {
         if (!await listening(porta, TOR_PORT_TIMEOUT_MS)) continue;
         if (await probe("socks5://127.0.0.1:" + porta, probeTimeout()) === null) continue;
         log("modo tor: daemon pronto na porta " + porta);
+        // Este probe passou: e prova fresca de que o daemon atende como proxy. Guardada para o
+        // torResponde nao repetir o teste logo em seguida (ver TOR_VALIDACAO_VALE_MS).
+        torValidadoEm = Date.now();
         return true;
     }
 
@@ -1045,13 +1112,49 @@ async function subirTor(porta) {
 // timeout to 60000ms after 18 timeouts"). Nesse estado o plugin girava "porta aberta mas nao
 // respondeu como proxy" de 30 em 30s para sempre e, como o modo tor segura o gateway em vez de
 // vazar direto, o Discord ficava carregando ate a pessoa reinicia-lo na mao.
-const TOR_FALHAS_PARA_REVIVER = 3;
+const TOR_FALHAS_PARA_REVIVER = 5;
 // Matar Tor em serie so troca um daemon ruim por um bootstrap eterno: cada subida custa
 // ~20-40s, e nesse meio tempo nao ha rota nenhuma.
 const TOR_REVIVE_COOLDOWN_MS = 5 * 60_000;
 let torFalhasSeguidas = 0;
+let torPrimeiraFalhaEm = 0;
 let ultimoReviveTorEm = 0;
 let revivendoTor = null;
+// O arranque insiste no Tor de perto; o batimento nao pode disputar o mesmo daemon ao mesmo
+// tempo, senao sao dois probes concorrentes no circuito que ainda esta nascendo.
+let insistindoNoTor = false;
+
+// Contagem sozinha nao basta para declarar zumbi: a insistencia do arranque tenta de 2 em 2s e
+// chegaria a tres falhas em ~30s, matando um daemon que ainda estava terminando o bootstrap.
+// Um minuto tambem nao bastou (02/09/2026: 19 reinicios num dia, varios com tunel real
+// entregando no meio deles). Cinco minutos e o prazo em que um daemon de fato travado nao se
+// recupera sozinho, e e mais longo que qualquer bootstrap ja medido nesta maquina.
+const TOR_ZUMBI_MIN_MS = 5 * 60_000;
+
+// Quanto tempo a aprovacao do probe feito dentro do subirTor continua valendo. O torResponde
+// e chamado logo depois do daemon subir e, sem isto, refazia o mesmo teste -- so que abrindo um
+// circuito NOVO, que nesta rede custa 10-20s com o gateway segurado a toa. Medido em
+// 02/09/2026: "daemon pronto na porta 9060" as 10:06:12 e, na sequencia, um probe estourando
+// 20s; a rota so subiu as 10:06:47.
+const TOR_VALIDACAO_VALE_MS = 15_000;
+let torValidadoEm = 0;
+
+// Prova de vida que vale mais que o probe: trafego de gateway que ATRAVESSOU o Tor. O probe
+// abre circuito novo a cada batimento, e circuito novo custa segundos nesta rede; o tunel vivo
+// anda no circuito ja quente. Enquanto houver entrega real dentro desta janela o daemon esta
+// vivo por definicao, e mata-lo troca uma rota que funciona por 20-90s de bootstrap.
+const TOR_REVIVE_SILENCIO_MS = 3 * 60_000;
+// Quando o Tor entregou trafego real pela ultima vez. Espelha o ativaEntregouEm, que so e
+// declarado bem mais adiante no arquivo.
+let torEntregouEm = 0;
+
+// Arranque no modo "tor": o primeiro circuito depois de o Tor ficar ocioso leva 10-15s, e o
+// probe de arranque tinha um tiro so -- errando, a proxima tentativa vinha so com o batimento,
+// 30s depois, com o gateway segurado o tempo todo. E esse intervalo que a pessoa sente como "o
+// Discord demora horrores para logar" (medido em 01/09/2026: probe estourando 10s as 15:24:16,
+// rota subindo so na abertura seguinte, as 15:25:06).
+const TOR_ARRANQUE_JANELA_MS = 120_000;
+const TOR_ARRANQUE_PAUSA_MS = 2000;
 
 function esperar(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -1185,8 +1288,18 @@ function reviveTor(porta, motivo) {
 // Porta aberta nao prova nada: o que prova e o tunel. Devolve true quando o Tor responde -- na
 // hora, ou depois de ser ressuscitado.
 async function torResponde(proxy, porta) {
+    // Prova fresca do subirTor: aproveita e nao gasta outro circuito para descobrir o mesmo.
+    // Consumida no primeiro uso -- vale para o arranque, nao para os batimentos seguintes.
+    if (torValidadoEm !== 0 && Date.now() - torValidadoEm < TOR_VALIDACAO_VALE_MS) {
+        torValidadoEm = 0;
+        torFalhasSeguidas = 0;
+        torPrimeiraFalhaEm = 0;
+        return true;
+    }
+
     if (await probe(proxy, probeTimeout()) !== null) {
         torFalhasSeguidas = 0;
+        torPrimeiraFalhaEm = 0;
         return true;
     }
 
@@ -1197,12 +1310,52 @@ async function torResponde(proxy, porta) {
     if (routeMode !== "tor") return false;
 
     torFalhasSeguidas++;
+    if (torFalhasSeguidas === 1) torPrimeiraFalhaEm = Date.now();
     if (torFalhasSeguidas < TOR_FALHAS_PARA_REVIVER) return false;
-    if (!await reviveTor(porta, torFalhasSeguidas + " conferencias seguidas com a porta aberta e o proxy mudo")) return false;
+    if (Date.now() - torPrimeiraFalhaEm < TOR_ZUMBI_MIN_MS) return false;
+
+    // Probe reprovado com tunel real entregando e sinal de probe apertado, nao de daemon morto.
+    if (torEntregouEm !== 0 && Date.now() - torEntregouEm < TOR_REVIVE_SILENCIO_MS) {
+        const entregouHa = Math.round((Date.now() - torEntregouEm) / 1000);
+        log("modo tor: o probe falhou, mas o Tor entregou trafego ha " + entregouHa + "s -- nao reinicio daemon vivo");
+        return false;
+    }
+
+    const falhandoHa = Math.round((Date.now() - torPrimeiraFalhaEm) / 1000);
+    if (!await reviveTor(porta, torFalhasSeguidas + " conferencias sem resposta em " + falhandoHa + "s")) return false;
 
     // O subirTor so devolve true depois de o daemon novo passar no probe.
     torFalhasSeguidas = 0;
+    torPrimeiraFalhaEm = 0;
     return true;
+}
+
+// Tenta o Tor de perto durante a janela de arranque, em vez de esperar o batimento. Sai no
+// primeiro sucesso -- ou quando alguem (o batimento, uma conexao do gateway) ja tiver resolvido.
+async function insisteNoTorNoArranque() {
+    const comecou = Date.now();
+    const limite = comecou + TOR_ARRANQUE_JANELA_MS;
+    insistindoNoTor = true;
+
+    try {
+        while (Date.now() < limite && chosenExit === null) {
+            await esperar(TOR_ARRANQUE_PAUSA_MS);
+            if (chosenExit !== null) return;
+
+            const tor = await detectTor();
+            if (tor !== null) {
+                settleExit(tor);
+                log("modo tor: Tor respondeu no arranque depois de " + Math.round((Date.now() - comecou) / 1000) + "s de insistencia");
+                return;
+            }
+        }
+
+        if (chosenExit === null) {
+            log("modo tor: o Tor nao respondeu em " + (TOR_ARRANQUE_JANELA_MS / 1000) + "s de insistencia; o batimento continua tentando");
+        }
+    } finally {
+        insistindoNoTor = false;
+    }
 }
 
 async function garanteTor() {
@@ -1623,6 +1776,7 @@ function agendarEstat() {
 function markGatewayRouted() {
     lastRoutedAt = Date.now();
     ativaEntregouEm = Date.now();
+    if (routeMode === "tor") torEntregouEm = Date.now();
     sessaoRoteadas++;
     if (reloadCount > 0) {
         // A recarga que foi disparada (maybeReloadAfterDirect) acabou de renascer:
@@ -1748,7 +1902,7 @@ function currentExit() {
 // depois da ultima, senao uma saida ruim derrubaria a API de saidas num loop.
 function refreshExit() {
     if (refreshingExit !== null) return refreshingExit;
-    if (Date.now() - lastRefreshAt < REFRESH_COOLDOWN_MS) return Promise.resolve(null);
+    if (Date.now() - lastRefreshAt < refreshCooldown()) return Promise.resolve(null);
 
     lastRefreshAt = Date.now();
     refreshingExit = (async () => {
@@ -1841,6 +1995,9 @@ async function beat() {
         // caminhos do batimento so rodam com uma saida ativa — e a sessao ficaria presa
         // para sempre recusando conexoes mesmo depois de o Tor voltar.
         if (routeMode === "tor" && chosenExit === null) {
+            // A insistencia do arranque ja esta tentando de 2 em 2s: dois detectTor juntos so
+            // dobram a carga no daemon que ainda esta abrindo o primeiro circuito.
+            if (insistindoNoTor) return;
             const tor = await detectTor();
             if (tor !== null) {
                 settleExit(tor);
@@ -1868,7 +2025,7 @@ async function checkPool() {
     // Camada 3: se a ativa entregou trafego de gateway dentro da janela do batimento, ela
     // esta viva por definicao — pular o probe dela poupa uma conexao na saida gratuita, que
     // limita conexoes simultaneas. A morte real cai no openThroughPool e vira troca ali.
-    if (active !== null && Date.now() - ativaEntregouEm > HEARTBEAT_MS) targets.push(active);
+    if (active !== null && Date.now() - ativaEntregouEm > heartbeatIntervalo()) targets.push(active);
     for (const entry of pool) if (!targets.includes(entry.proxy)) targets.push(entry.proxy);
     if (targets.length === 0) return;
 
@@ -2125,7 +2282,16 @@ async function openThroughPool(target) {
     // A ativa sozinha primeiro: ela e o IP que o servidor ja viu nesta sessao, e trocar sem
     // precisar seria pedir uma reavaliacao a toa.
     const tAtiva = Date.now();
-    const direto = await openTunnel(active, target.host, target.port, relayTimeout());
+    let direto = await openTunnel(active, target.host, target.port, relayTimeout());
+
+    // Modo "tor": insiste na mesma saida antes de dar a conexao por perdida (ver
+    // TOR_TENTATIVAS_TUNEL). Nao ha para onde trocar neste modo -- o pool esta vazio e o cache
+    // e ignorado --, entao desistir aqui e recusar o gateway, nao escolher outro caminho.
+    for (let tentativa = 2; direto === null && routeMode === "tor" && tentativa <= TOR_TENTATIVAS_TUNEL; tentativa++) {
+        log("modo tor: " + target.host + " nao veio em " + relayTimeout() + "ms, tentativa " + tentativa + "/" + TOR_TENTATIVAS_TUNEL);
+        direto = await openTunnel(active, target.host, target.port, relayTimeout());
+    }
+
     if (direto !== null) {
         markGatewayRouted();
         log("tunel.aberto | alvo=" + target.host + " saida=" + safeProxy(active) + " via=ativa latencia=" + (Date.now() - tAtiva) + "ms");
@@ -2491,8 +2657,10 @@ async function start() {
                             quarentenar(antiga, "rajada de reconexoes");
                         } else {
                             gatewayReconexoes.length = 0;
+                            // O quarentenar ja loga o que aconteceu de verdade -- inclusive
+                            // quando recusa a quarentena (modo tor, saida configurada). A linha
+                            // extra que existia aqui afirmava "em quarentena" nos dois casos.
                             quarentenar(chosenExit, RECONEXAO_LIMITE + "+ reconexoes sem troca util");
-                            log(safeProxy(chosenExit) + " com " + RECONEXAO_LIMITE + "+ reconexoes do gateway sem troca util (cooldown ou reserva pior), em quarentena");
                         }
                     }
                 }
@@ -2510,6 +2678,9 @@ async function start() {
         // responder settleExit(tor) religa a rota. Vazar direto aqui renasceria o gateway
         // pelo IP brasileiro — exatamente o carregamento infinito que o projeto combate.
         log("modo tor: sem Tor no arranque, conexoes ficam seguradas ate um Tor responder");
+        // Nada aguarda isto: o gateway ja esta segurado no roteador, e quem libera as conexoes
+        // pendentes e o settleExit la dentro.
+        insisteNoTorNoArranque().catch(error => log("a insistencia no Tor falhou: " + error.message));
     } else {
         settleExit(exit);
         log(exit === null ? "nenhuma saida respondeu, o gateway vai sair direto" : "saida escolhida: " + safeProxy(exit));
@@ -2517,8 +2688,8 @@ async function start() {
 
     // So depois da primeira escolha: batimento correndo junto da busca inicial disputaria banda
     // com ela, e e a busca inicial que segura o gateway.
-    setInterval(() => { beat(); }, HEARTBEAT_MS);
-    log("batimento ligado: reconfiro as saidas a cada " + Math.round(HEARTBEAT_MS / 1000) + "s");
+    setInterval(() => { beat(); }, heartbeatIntervalo());
+    log("batimento ligado: reconfiro as saidas a cada " + Math.round(heartbeatIntervalo() / 1000) + "s");
 }
 
 // Como plugin do Vencord, quem sobe o Discord original e o patcher do Vencord. Aqui so
